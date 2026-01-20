@@ -1,631 +1,759 @@
-
+import os
 import sys
-##if sys.stdout.encoding != 'utf-8':
-##    sys.stdout.reconfigure(encoding='utf-8')
-
-import pandas as pd
-import numpy as np
+import builtins
+import gradio as gr
 import json
-from typing import List, Dict, Any
-import prompts
+from typing import Annotated, TypedDict, List
+import uuid
+import os
 
-from typing import List, Dict, Any, Optional
-import funciones
-from datetime import datetime
+# Cargar variables de entorno
+from dotenv import load_dotenv
+load_dotenv()
+
+# Importamos MemorySaver para la persistencia
+from langgraph.checkpoint.memory import MemorySaver 
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langgraph.graph import StateGraph, END, START
+from langgraph.graph.message import add_messages
+
+# Importaciones locales
 from modelosIA import llm
+import prompts
+import funciones
+import bd
+from langsmith import traceable
 
-####################################
-###     LLM
-#####################################
+from ingesta_bd import ingestar, existe_region
+import ingesta_ref  
+import folium
 
-def run_llm(
-    prompt: str,
-    tools: Optional[List[Dict]] = None,
-    tool_functions: Optional[Dict[str, Any]] = None,
-) -> str:
+from langchain_core.tools import tool
+
+
+
+# --- REVISAR SI QUEDARÁ ESTA CONFIGURACIÓN GLOBAL UTF-8 ---
+
+os.environ["PYTHONUTF8"] = "1"
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except AttributeError:
+    pass
+
+if not hasattr(builtins, "_original_open_seguro"):
+    builtins._original_open_seguro = builtins.open
+
+def open_utf8_safe(*args, **kwargs):
+    original = builtins._original_open_seguro
+    if 'encoding' in kwargs: return original(*args, **kwargs)
+    mode = kwargs.get('mode')
+    if mode is None and len(args) > 1: mode = args[1]
+    if mode is None or 'b' not in str(mode): kwargs['encoding'] = 'utf-8'
+    return original(*args, **kwargs)
+builtins.open = open_utf8_safe
+
+
+
+
+conexion = bd.conexion_bd()
+
+# --- 2. CONFIGURACIÓN DEL ESTADO ---
+AgentState = TypedDict("AgentState", {
+    "mensajes": Annotated[List[BaseMessage], add_messages],
+    "siguiente_nodo": str,
+    "ultimo_agente": str,
+    "caracteristicas_geoclimaticas": str,
+    "pais": str,
+    "departamento": str,
+    "ciudad": str,
+    "resultados_evaluacion": list,
+    "datos_celdas": str,
+    "capas_referencia": list
+})
+
+def formatear_reglas_html(reglas):
     """
-   Ejecuta una solicitud a un LLM que opcionalmente admite el uso de herramientas.
-
-Argumentos:
-    prompt (str): El prompt del sistema o del usuario que se enviará.
-    tools (list[dict], opcional): Lista de esquemas de herramientas para la llamada a funciones del modelo.
-    tool_functions (dict[str, callable], opcional): Mapeo de nombres de herramientas a funciones de Python.
-
-Retorna:
-    str: Texto final de la respuesta del LLM.
+    Genera una tabla HTML.
+    - Si 'reglas' es una lista (mes a mes): Tabla matricial (Param x Meses) con scroll.
+    - Si 'reglas' es un dict (resumen): Tabla vertical simple.
     """
+    if not reglas: 
+        return "<div style='padding:10px; color:#666;'>Esperando definición de cultivo...</div>"
 
-    # Step 1: Initial LLM call
-    from langchain_core.messages import SystemMessage
-    messages = [SystemMessage(content=prompt)]
-    
-    if tools:
-        llm_with_tools = llm.bind_tools(tools)
-        response = llm_with_tools.invoke(messages)
-    else:
-        response = llm.invoke(messages)
-    
-    message = response
-
-    # Si no hay herramientas, responder con LLM directamente
-    if not getattr(message, "tool_calls", None):
-        return message.content
-
-    # En caso no existan herramientas definidas, no se puede proceder
-    if not tool_functions:
-        return message.content + "\n\n!!!!!! No se proporcionaron funciones de herramienta para ejecutar las llamadas a herramientas."
-
-    tool_messages = []
-    for tool_call in message.tool_calls:
-        # Extraer el nombre de la función y los argumentos de tool_call - manejar tanto formatos dict como objeto
-        func_name = None
-        args = {}
-        tool_call_id = None
+    # ==========================================
+    # CASO A: LISTA DE MESES (Visión Anual)
+    # ==========================================
+    if isinstance(reglas, list):
+        # 1. Organizar datos por mes (1..12) y recolectar parámetros únicos
+        datos_por_mes = {m: {} for m in range(1, 13)}
+        all_params = set()
         
-        # Verificar si es un dict
-        if isinstance(tool_call, dict):
-            func_name = tool_call.get('name')
-            args = tool_call.get('args', {})
-            tool_call_id = tool_call.get('id')
+        datos_validos = False
+        
+        for item in reglas:
+            if not isinstance(item, dict): continue
+            
+            # Intentar obtener el número de mes
+            mes_raw = item.get('mes')
+            if mes_raw is None: continue 
+            
+            try:
+                m_idx = int(mes_raw)
+                if 1 <= m_idx <= 12:
+                    datos_por_mes[m_idx] = item
+                    datos_validos = True
+                    # Recolectar claves (excepto 'mes')
+                    for k in item.keys():
+                        if k.lower() != 'mes':
+                            all_params.add(k)
+            except: continue
+        
+        # Si no se pudo estructurar como matriz mensual, hacer fallback a merge
+        if not datos_validos:
+            merged = {}
+            for item in reglas:
+                if isinstance(item, dict): merged.update(item)
+            reglas = merged # Pasar al bloque de dict
         else:
-            # Es un objeto - intentar diferentes nombres de atributos
-            if hasattr(tool_call, 'function'):
-                # Formato del Modelo con .function                
-                func_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments or "{}")
-            elif hasattr(tool_call, 'name'):
-                # Formato LangChain con .name directamente
-                func_name = tool_call.name
-                args = tool_call.args if hasattr(tool_call, 'args') else {}
+            # Construir Tabla Matriz con Scroll Horizontal
+            html = """
+            <div style='max-height: 200px; overflow: auto; border: 1px solid #eee; border-radius: 8px; background: white;'>
+                <table style='width:100%; border-collapse: collapse; font-family: sans-serif; font-size: 11px; white-space: nowrap;'>
+                    <thead>
+                        <tr style='background-color: #2b3137; color: white;'>
+                            <th style='padding: 6px; position: sticky; top: 0; left: 0; z-index: 2; background-color: #2b3137; border-right: 1px solid #555;'>Param</th>
+            """
+            # Cabeceras 1..12
+            for m in range(1, 13):
+                html += f"<th style='padding: 4px 8px; text-align:center; position: sticky; top: 0; z-index: 1; background-color: #2b3137;color: white;'>{m}</th>"
             
-            tool_call_id = tool_call.id if hasattr(tool_call, 'id') else None
+            html += "</tr></thead><tbody>"
+            
+            # Filas por Parámetro
+            for i, param in enumerate(sorted(list(all_params))):
+                bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+                
+                # Icono
+                icon = "🔹"
+                p_lower = param.lower()
+                if "temp" in p_lower: icon = "🌡️"
+                elif "humedad" in p_lower: icon = "💧"
+                elif "precip" in p_lower: icon = "🌧️"
+                elif "suelo" in p_lower: icon = "🌱"
+                elif "alt" in p_lower or "elev" in p_lower: icon = "⛰️"
+                elif "viento" in p_lower: icon = "💨"
+                
+                html += f"""
+                <tr style='background-color: {bg}; border-bottom: 1px solid #eee;'>
+                    <td style='padding: 5px 8px; font-weight: bold; position: sticky; left: 0; background-color: {bg}; z-index: 1; border-right: 1px solid #ddd;'>
+                        {icon} {param.capitalize()}
+                    </td>
+                """
+                
+                # Celdas Mes 1..12
+                for m in range(1, 13):
+                    val_obj = datos_por_mes[m].get(param)
+                    val_str = "-"
+                    
+                    if isinstance(val_obj, dict):
+                        if 'min' in val_obj and 'max' in val_obj:
+                            val_str = f"{val_obj['min']}-{val_obj['max']}"
+                        else:
+                            val_str = "..."
+                    elif val_obj is not None:
+                        val_str = str(val_obj)
+                        
+                    html += f"<td style='padding: 4px; text-align: center; color: #444;'>{val_str}</td>"
+                
+                html += "</tr>"
+            
+            html += "</tbody></table></div>"
+            return html
+# """ 
+#     # ==========================================
+#     # CASO B: DICCIONARIO SIMPLE (Resumen)
+#     # ==========================================
+
+#     if isinstance(reglas, dict):
+
+#         html = """
+#         <div style='max-height: 200px; overflow-y: auto; border: 1px solid #eee; border-radius: 8px; background: white;'>
+#             <table style='width:100%; border-collapse: collapse; font-family: sans-serif; font-size: 12px;'>
+#                 <thead>
+#                     <tr style='background-color: #2b3137; color: white; text-align: left;'>
+#                         <th style='padding: 6px 10px; position: sticky; top: 0;'>Parámetro</th>
+#                         <th style='padding: 6px 10px; position: sticky; top: 0;'>Valor</th>
+#                     </tr>
+#                 </thead>
+#                 <tbody>
+#         """
+#         for i, (k, v) in enumerate(reglas.items()):
+#             if k == 'mes': continue 
+#             bg_color = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+            
+#             val_str = str(v)
+#             if isinstance(v, dict) and 'min' in v and 'max' in v:
+#                 val_str = f"<span style='color:#d9534f;'>{v['min']}</span> - <span style='color:#5cb85c;'>{v['max']}</span>"
+            
+#             icon = "🔹"
+#             k_l = k.lower()
+#             if "temp" in k_l: icon = "🌡️"
+#             elif "humedad" in k_l: icon = "💧"
+#             elif "precip" in k_l: icon = "🌧️"
+#             elif "suelo" in k_l: icon = "🌱"
+            
+#             html += f"""
+#                 <tr style='background-color: {bg_color}; border-bottom: 1px solid #eee;'>
+#                     <td style='padding: 6px 10px; font-weight: 500;'>{icon} {k.capitalize()}</td>
+#                     <td style='padding: 6px 10px; color: #444;'>{val_str}</td>
+#                 </tr>
+#             """
+#         html += "</tbody></table></div>"
+#         return html """
+
+    return f"<div>{str(reglas)}</div>"
+
+# TOOLS 
+
+
+@tool
+def tool_analisis_referencias(criterios: List[dict], pais, departamento, ciudad: str):
+    """
+    Realiza un análisis espacial combinatorio.
+    La referencia solo puede ser "rios"
+    La condicion puede ser "cerca" o "lejos"
+    La distancia la tiene que dar el usuario en metros. Si no la da, entonces no uses esta tool.
+
+    Args:
+        criterios: Lista de dicts. Ejemplo: 
+                   [{"referencia": "rios", "condicion": "cerca", "distancia": 500}]
+                   Valores válidos referencia: 'rios', 'carreteras', 'puntos_interes'.
+                   Valores válidos condicion: 'cerca', 'lejos'.
+                   Distancia en metros.
+        ciudad: Nombre de la ciudad (ej: 'Canta').
+        pais: Nombre del país (ej: 'Perú').
+        departamento: Nombre del departamento o estado (ej: 'Lima').
+    """
+    print(f"🛠️ EJECUTANDO TOOL ANÁLISIS: {criterios} en {ciudad}")
+    try:
+        pais = bd.normalizar_texto(pais)
+
+        resultado = ingesta_ref.analisis_postgis(pais, departamento, ciudad, criterios)
+        return resultado
+    except Exception as e:
+        return f"Error en análisis: {str(e)}"
+# """
+#         # Formateamos un resumen texto para el LLM
+#         num_celdas = len(resultado['celdas_filtradas'])
+#         logs = "\n".join(resultado['logs'])
         
-        # Omitir si no pudimos extraer el nombre de la función
-        if not func_name:
-            continue
-            
-        tool_fn = tool_functions.get(func_name)
+#         msg = f"Análisis completado.\nLogs de Ingesta: {logs}\nSe encontraron {num_celdas} celdas que cumplen TODOS los criterios."
+        
+#         # RETORNAMOS UN OBJETO RICO (Texto + Datos Ocultos)
+#         return {
+#             "mensaje": msg, 
+#             "datos_celdas": resultado['celdas_filtradas'],
+#             "datos_ref": resultado['referencias_mapa']
+#         }
 
-        try:
-            result = tool_fn(**args) if tool_fn else {"error": f"Tool '{func_name}' not implemented."}
-        except Exception as e:
-            result = {"error": str(e)}
+# """
 
-        tool_messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": json.dumps(result)
-        })
     
-    # Paso 4: Segunda pasada — enviar las salidas de las herramientas de vuelta al modelo
-    from langchain_core.messages import SystemMessage, ToolMessage
+
+# --- NODOS (AGENTES) ---
+
+def agente_supervisor(state: AgentState):
+    print('--- Nodo Supervisor Ejecutado ---')
+    ultimo_activo = state.get("ultimo_agente", "")
     
-    followup_messages = [
-        SystemMessage(content=prompt),
-        message,
-    ]
+    if ultimo_activo == "nodo_region": return {"siguiente_nodo": "nodo_region"}
+    if ultimo_activo == "nodo_negocio": return {"siguiente_nodo": "nodo_negocio"}
     
-    for tool_msg in tool_messages:
-        followup_messages.append(ToolMessage(
-            tool_call_id=tool_msg["tool_call_id"],
-            content=tool_msg["content"]
-        ))
+    mensajes = [SystemMessage(content=prompts.PROMPT_SUPERVISOR)] + state['mensajes']
+    respuesta = llm.invoke(mensajes)
+    contenido = respuesta.content.strip()
+    
+    if "NEGOCIO" in contenido: return {"siguiente_nodo": "nodo_negocio"}
+    else: return {"mensajes": [respuesta], "siguiente_nodo": "end"}
 
-    final = llm.invoke(followup_messages)
-    return final.content
+def agente_negocio(state: AgentState):
+    print('--- Nodo Negocio Ejecutado ---')
+    mensajes = [SystemMessage(content=prompts.PROMPT_NEGOCIO)] + state['mensajes']
+    respuesta = llm.invoke(mensajes)
+    contenido = respuesta.content
 
-
-
-################################################
-###         BITACORA de EVENTOS
-################################################
-
-
-import logging
-from typing import Dict, Any, List
-
-file_handler = logging.FileHandler('historial.log', encoding='utf-8')
-stream_handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-file_handler.setFormatter(formatter)
-stream_handler.setFormatter(formatter)
-
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[file_handler, stream_handler]
-)
-
-logger = logging.getLogger(__name__)
-
-
-
-################################################
-###         TOOLS
-################################################
-# =====================================================
-#  Definir las funciones de las herramientas
-# =====================================================
-
-    #return {"result": funciones.temperatura(fechainicial, fechafinal, region)}
-
-   
-
-def ask_user(question: str, missing_info: str = ""):
-    """Consulta al usuario y espera la respuesta."""
-    logger.info(f"Preguntando al usuario: {question}")
-    if missing_info:
-        print(f"---SE REQUIERE INFORMACIÓN---\nInformación faltante: {missing_info}")
+    if "##PASAR_A_AGENTE_REGION##" in contenido:
+        contenido_limpio = contenido.replace("##PASAR_A_AGENTE_REGION##", "").strip()
+        return {"mensajes": [AIMessage(content=contenido_limpio)], "siguiente_nodo": "nodo_region", "ultimo_agente": ""}
     else:
-        print(f"---SE REQUIERE INFORMACIÓN DEL USUARIO---")
-    
-    answer = input(f"{question}: ")
-    logger.info(f"Respuesta del usuario: {answer}")
-    return {"context": answer, "source": "Información del Usuario"}
+        return {"mensajes": [respuesta], "siguiente_nodo": "end", "ultimo_agente": "nodo_negocio"}
 
+def agente_region(state: AgentState):
+    print('--- Nodo Región Ejecutado ---')
+    mensajes = [SystemMessage(content=prompts.PROMPT_REGION)] + state['mensajes']
+    respuesta = llm.invoke(mensajes)
+    contenido = respuesta.content
 
+    if "##PASAR_A_AGENTE_CARACTERISTICAS##" in contenido:
+        contenido_limpio = contenido.replace("##PASAR_A_AGENTE_CARACTERISTICAS##", "").strip()
+        try:
+            contenido_dict = json.loads(contenido_limpio)
+            tabla_md = "\n\n" + funciones.diccionario_a_tabla_md(contenido_dict)
+            resultado = "Se identificó la siguiente ubicación. Cargando mapa...: " + tabla_md
 
+            pais = contenido_dict.get('pais', '')
+            departamento = contenido_dict.get('departamento', '')
+            ciudad = contenido_dict.get('ciudad', '')
 
+            pais = bd.normalizar_texto(pais)
+            #departamento = bd.normalizar_texto(departamento)
+            #ciudad = bd.normalizar_texto(ciudad)
 
-
-################################################
-###         AGENTES 
-################################################
-
-
-
-#   AGENTE SUPERVISOR
-#########################################
-
-def agente_supervisor(state):
-    print("---AGENTE SUPERVISOR---")
-    
-    n_iter = state.get("n_iteration", 0) + 1
-    state["n_iteration"] = n_iter
-    print(f"Iteración del supervisor: {n_iter}")
-
-    # Finalizar al llegar al límite de iteraciones
-
-    if n_iter >= 3:
-        print("!!!!! Se llegó al límite de iteraciones.")
-        updated_history = (
-            state.get("conversation_history", "")
-            + "\nAsistente: Se llegó al límite de iteraciones. Finalizando."
-        )
+            if not existe_region(pais, departamento, ciudad):
+                print ("⚠️ Región no existe en BD, iniciando ingesta...")
+                ingestar(pais, departamento, ciudad)       
+        except json.JSONDecodeError:
+            tabla_md = contenido_limpio
+            contenido_dict = {}
+            resultado = contenido_limpio
+            print ("⚠️ Error al cargar la Región de la BD...")
         return {
-            "conversation_history": updated_history,
-            "next_agent": "end",
-            "n_iteration": n_iter
+            "mensajes": [AIMessage(content=resultado)], 
+            "siguiente_nodo": "nodo_caracteristicas",
+            "ultimo_agente": "",
+            "pais": contenido_dict.get('pais', ''),
+            "departamento": contenido_dict.get('departamento', ''),
+            "ciudad": contenido_dict.get('ciudad', '')
         }
     
-    # ¿Requiere más información por parte del usuario?
-    if state.get("needs_clarification", False):
-        user_clarification = state.get("user_clarification", "")
-        print(f"Procesando aclaración del usuario: {user_clarification}")
-        
-        # Actualizar el historial de conversación con el intercambio de aclaraciones
-        clarification_question = state.get("clarification_question", "")
-        updated_conversation = state.get("conversation_history", "") + f"\nAsistente: {clarification_question}\nUsuario: {user_clarification}"
-        
-        # Actualizar el estado para borrar los estados de la aclaración
-        updated_state = state.copy()
-        updated_state["needs_clarification"] = False
-        updated_state["conversation_history"] = updated_conversation
-        
-        # Borrar los campos de aclaración
-        if "clarification_question" in updated_state:
-            del updated_state["clarification_question"]
-        if "user_clarification" in updated_state:
-            del updated_state["user_clarification"]
-            
-        return updated_state
-
-    user_query = state["user_input"]
-    conversation_history = state.get("conversation_history", "")
+    else:
+        return {"mensajes": [respuesta], "siguiente_nodo": "end", "ultimo_agente": "nodo_region"}
     
-    print(f"Consulta del usuario: {user_query}")
-    print(f"Historial de conversación: {conversation_history}")
-    
-    # Incluir el historial de la conversación en el prompt
-    full_context = f"Conversación completa:\n{conversation_history}"
-    
-    prompt = prompts.SUPERVISOR_PROMPT.format(
-        conversation_history=full_context,  # Usar el contexto completo en lugar de solo el historial
-    )
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "ask_user",
-                "description": "Preguntar al usuario para aclaración o información adicional cuando su consulta no esté clara o falten detalles importantes. USAR SOLO si falta información esencial como número de póliza o ID de cliente.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "La pregunta específica para hacer al usuario para aclaración"
-                        },
-                        "missing_info": {
-                            "type": "string", 
-                            "description": "Información específica que esté faltando o que necesite aclaración"
-                        }
-                    },
-                    "required": ["question", "missing_info"]
-                }
-            }
-        }
-    ]
+def agente_carateristicas(state: AgentState):
+    print('--- Nodo Características Ejecutado ---')
+    mensajes = [SystemMessage(content=prompts.PROMPT_CARACTERISTICAS)] + state['mensajes']
+    respuesta = llm.invoke(mensajes)
+    contenido = respuesta.content
 
-    print("... Llamando al LLM para la decisión del supervisor...")
-    from langchain_core.messages import SystemMessage
-    messages = [SystemMessage(content=prompt)]
-    llm_with_tools = llm.bind_tools(tools)
-    response = llm_with_tools.invoke(messages)
-
-    message = response
-
-    # Comprobar si el supervisor quiere pedir aclaración al usuario
-    if getattr(message, "tool_calls", None):
-        print (getattr(message, "tool_calls", None))
-        print("🛠️ Supervisor solicitando aclaración del usuario")
-        for tool_call in message.tool_calls:
-            # Verificar los formatos para la llamada a tools
-            tool_name = None
-            tool_args = {}
-            
-            if isinstance(tool_call, dict):
-                # Formato DICT
-                tool_name = tool_call.get("name")
-                tool_args = tool_call.get("args", {})
+    if "##PASAR_A_AGENTE_GEOCLIMATICO##" in contenido:
+        contenido_limpio = contenido.replace("##PASAR_A_AGENTE_GEOCLIMATICO##", "").strip()
+        try:
+            json_str = contenido_limpio.replace("```json", "").replace("```", "").strip()
+            if "{" in json_str or "[" in json_str:
+                contenido_dict = json_str 
             else:
-                # Formato OBJETO
-                if hasattr(tool_call, 'name'):
-                    tool_name = tool_call.name
-                    tool_args = tool_call.args if hasattr(tool_call, 'args') else {}
-                elif hasattr(tool_call, 'function'):
-                    # Formato Modelo
-                    tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments or "{}")
+                contenido_dict = json_str
+        except:
+            contenido_dict = contenido_limpio
+        
+        return {
+            "mensajes": [AIMessage(content="Analizando requerimientos del cultivo...")],
+            "siguiente_nodo": "nodo_geoclimatico",
+            "ultimo_agente": "",
+            "caracteristicas_geoclimaticas": contenido_dict
+        }
+    else:
+        return {"mensajes": [respuesta], "siguiente_nodo": "end", "ultimo_agente": "nodo_caracteristicas"}
+
+
+def agente_geoclimatico(state: AgentState):
+    import pandas as pd
+    import json
+
+    print('--- Nodo Geoclimatico Ejecutado ---')
+    
+    # 1. RECUPERAR REGLAS
+    raw_rules = state.get("caracteristicas_geoclimaticas", "[]")
+    reglas_terreno = {}
+
+    try:
+        if isinstance(raw_rules, str):
+            texto = raw_rules.replace("```json", "").replace("```", "").strip()
+            idx_inicio = texto.find("[")
+            idx_fin = texto.rfind("]")
             
-            print("🛠️ Nombre del tool: " + tool_name)
+            if idx_inicio != -1 and idx_fin != -1:
+                json_str = texto[idx_inicio : idx_fin + 1]
+                lista_datos = json.loads(json_str)
+            else:
+                lista_datos = []
+        elif isinstance(raw_rules, list):
+            lista_datos = raw_rules
+        else:
+            lista_datos = []
 
-            if tool_name == "ask_user":
-                question = tool_args.get("question", "Por favor proporcione más detalles.")
-                missing_info = tool_args.get("missing_info", "información adicional")
-                
-                print(f"Preguntando al usuario: {question}")
-                
-                user_response_data = ask_user(question, missing_info)
-                user_response = user_response_data["context"]
-                
-                print(f"Respuesta del usuario: {user_response}")
-                
-                # Actualizar el historial de la conversación con la pregunta y la respuesta
-                updated_history = conversation_history + f"\nAsistente: {question}"
-                updated_history = updated_history + f"\nUsuario: {user_response}"
-                
-                return {
-                    "needs_clarification": True,
-                    "clarification_question": question,
-                    "user_clarification": user_response,
-                    "conversation_history": updated_history
-                }
+        for item in lista_datos:
+            if isinstance(item, dict):
+                reglas_terreno.update(item)
 
-    # Si no hay llamadas a herramientas, proceder con la decisión normal del supervisor
-    message_content = message.content.strip()
+    except Exception as e:
+        print(f"⚠️ Error reglas: {e}")
+        reglas_terreno = {}
+
+    print(f"📋 Reglas aplicadas: {reglas_terreno}")
+
+    # 2. TRAER DATOS
+    pais = state.get("pais", "")
+    departamento = state.get("departamento", "")
+    ciudad = state.get("ciudad", "")
+    print(f"🕵️ Buscando datos para: {ciudad}...")
     
-    print(f"***** Respuesta del LLM (primeros 300 chars):\n{message_content[:500]}\n")
+    data = bd.obtener_datos_celda(conexion, pais, departamento, ciudad, limit=10000)
+
+    if data.empty:
+        return {
+            "mensajes": [AIMessage(content=f"No hay datos para {ciudad}.")],
+            "siguiente_nodo": "end",
+            "resultados_evaluacion": []
+        }
+
+    # 3. EVALUACIÓN
+    try:
+        df_evaluado = funciones.evaluar_idoneidad_terreno(data.copy(), reglas_terreno)
+    except Exception as e:
+        print(f"❌ Error evaluación: {e}")
+        return {
+            "mensajes": [AIMessage(content="Error técnico en evaluación.")],
+            "siguiente_nodo": "end",
+            "resultados_evaluacion": []
+        }
     
-    import re
-    parsed = None
+    # 4. REPORTE
+    texto_top_ranking = funciones.generar_reporte_top_celdas(df_evaluado, top_n=5)
+    
+    # 5. LLM
+    prompt_narrativo = f"""
+    Actúa como Ingeniero experto.
+    CONTEXTO: Evaluación de {len(df_evaluado)} sectores en {ciudad}.
+
+    HERRAMIENTAS: 'tool_analisis_referencias'.
+    
+    TAREA:
+    SI el usuario pregunta por cercanía a ríos, carreteras o puntos de interés:
+    1. Usa la herramienta 'tool_analisis_referencias' solo cuando pida distancias a alguna referencia  y explica qué celdas cumplen la condición de referencias.
+    2. Genera los criterios adecuados (ej: "cerca" 500m, "lejos" 1000m).
+    3. Como "referencia" solo puedes usar "rios".
+    4. Como "condicion" solo puedes usar "cerca" o "lejos".
+    5. La "distancia" debe ser en metros y debe ser proporcionada por el usuario.
+    
+    Si no pregunta por infraestructura, haz tu evaluación agrónoma normal basada en clima.
+    Finalmente indica cuántas celdas cumplen los criterios.
+
+    {texto_top_ranking}
+    """
+
+    
+    mensajes_para_llm = state['mensajes'] + [SystemMessage(content=prompt_narrativo)]
+    # NUEVO
+    llm_con_tools = llm.bind_tools([tool_analisis_referencias])
+    respuesta_llm = llm_con_tools.invoke(mensajes_para_llm)
+
+    # ==============================================================================
+    # Invocar al Tool
+    # ==============================================================================
+    if respuesta_llm.tool_calls:
+        
+        # 1. Capturamos los argumentos que generó el LLM
+        call = respuesta_llm.tool_calls[0]
+        args = call['args']
+        resultado_tool = tool_analisis_referencias.invoke(args)
+        
+        # 3. Procesamos el resultado para actualizar el mapa
+        if isinstance(resultado_tool, dict):
+            celdas_filtradas = resultado_tool.get('celdas_filtradas', [])
+            nuevas_capas = resultado_tool.get('referencias_mapa', [])
+
+            ids_permitidos = [c.get('id_celda') for c in celdas_filtradas if c.get('id_celda')]
+            df_filtrado_final = df_evaluado[df_evaluado['id_celda'].isin(ids_permitidos)]
+            datos_para_mapa = df_filtrado_final.to_dict(orient='records')
+
+#            logs = resultado_tool.get('logs', [])
+            
+#            msg_texto = f"*** Análisis espacial: Se encontraron **{len(nuevas_celdas)} sectores** cerca de {args.get('criterios', 'lo solicitado')}."
+            msg_texto = respuesta_llm.content 
+
+
+            # RETORNAMOS EL ESTADO ACTUALIZADO CON LOS NUEVOS DATOS
+            return {
+                "mensajes": [AIMessage(content=msg_texto)],
+                "siguiente_nodo": "end",
+                "ultimo_agente": "nodo_geoclimatico",
+                "resultados_evaluacion": datos_para_mapa, # <--- MAPA FILTRADO
+                "capas_referencia": nuevas_capas        # <--- RIOS PINTADOS
+            }
+        
+
+    datos_para_mapa = df_evaluado.to_dict(orient='records')
+    
+    return {
+        "mensajes": [respuesta_llm],
+        "siguiente_nodo": "end",
+        "ultimo_agente": "nodo_geoclimatico",
+        "resultados_evaluacion": datos_para_mapa
+    }
+
+# --- 5. GRAFO ---
+def create_workflow():
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("nodo_supervisor", agente_supervisor)
+    workflow.add_node("nodo_negocio", agente_negocio)
+    workflow.add_node("nodo_region", agente_region)
+    workflow.add_node("nodo_caracteristicas", agente_carateristicas)
+    workflow.add_node("nodo_geoclimatico", agente_geoclimatico)
+
+    workflow.add_edge(START, "nodo_supervisor")
+
+    def route_supervisor(state: AgentState):
+        if state["siguiente_nodo"] in ("nodo_negocio", "nodo_region", "nodo_caracteristicas", "nodo_geoclimatico"):
+            return state["siguiente_nodo"]
+        return END    
+    
+    workflow.add_conditional_edges("nodo_supervisor", route_supervisor, 
+        {"nodo_negocio": "nodo_negocio", "nodo_region": "nodo_region", "nodo_caracteristicas": "nodo_caracteristicas", "nodo_geoclimatico": "nodo_geoclimatico", END: END})
+    workflow.add_conditional_edges("nodo_negocio", lambda x: "nodo_region" if x["siguiente_nodo"] == "nodo_region" else END, {"nodo_region": "nodo_region", END: END})
+    workflow.add_conditional_edges("nodo_region", lambda x: "nodo_caracteristicas" if x["siguiente_nodo"] == "nodo_caracteristicas" else END, {"nodo_caracteristicas": "nodo_caracteristicas", END: END})
+    workflow.add_conditional_edges("nodo_caracteristicas", lambda x: "nodo_geoclimatico" if x["siguiente_nodo"] == "nodo_geoclimatico" else END, {"nodo_geoclimatico": "nodo_geoclimatico", END: END})
+
+    workflow.add_edge("nodo_geoclimatico", END)
+
+    memory = MemorySaver()
+    return workflow.compile(checkpointer=memory)
+
+
+
+
+app_graph = create_workflow()
+
+# --- 6. LOGICA CHAT Y DATOS ---
+
+def logica_chat(mensaje, history, session_id):
+    config = {"configurable": {"thread_id": session_id} }
+    inputs = {"mensajes": [HumanMessage(content=mensaje)]}
+    
+    texto_acumulado = ""
+    datos_mapa_final = None
+    html_esperada = None # Variable para el HTML
+    info_actual = None
+    
+    capas_visuales = [] # Inicializar
+
+    try:
+        for chunk in app_graph.stream(inputs, config=config, stream_mode="updates"):
+            
+            for nombre_nodo, valores in chunk.items():
+                
+                # A) REGLAS -> CONVERTIR A HTML
+                if "caracteristicas_geoclimaticas" in valores:
+                    raw = valores["caracteristicas_geoclimaticas"]
+                    info_dict = {}
+                    if isinstance(raw, str):
+                        try:
+                            clean = raw.replace("```json", "").replace("```", "").strip()
+                            if "[" in clean:
+                                info_dict = json.loads(clean[clean.find("["):clean.rfind("]")+1])
+                            elif "{" in clean:
+                                info_dict = json.loads(clean[clean.find("{"):clean.rfind("}")+1])
+                            else:
+                                info_dict = {"Info": raw}
+                        except:
+                            info_dict = {"Info": raw}
+                    else:
+                        info_dict = raw
+                    
+                    # Convertimos a HTML aquí mismo
+                    html_esperada = formatear_reglas_html(info_dict)
+
+                # B) RESULTADOS (CONDICIONES ACTUALES)
+                if "resultados_evaluacion" in valores and valores["resultados_evaluacion"]:
+                    datos_mapa_final = valores["resultados_evaluacion"]
+                    top_5 = datos_mapa_final[:5]
+                    info_actual = []
+                    for d in top_5:
+                        info_actual.append({
+                            "ID": d.get("id", "?"),
+                            "Score": d.get("score", 0),
+                            "Temp": f"{d.get('temp_promedio',0):.1f}",
+                            "Diagnostico": d.get("explicacion", "")[:60] + "..."
+                        })
+
+                # C) CHAT
+                if "mensajes" in valores:
+                    mensajes_nuevos = valores["mensajes"]
+                    for msg in mensajes_nuevos:
+                        if isinstance(msg, AIMessage) and msg.content:
+                            if nombre_nodo == "nodo_caracteristicas": continue
+                            bloque_nuevo = f"\n\n{msg.content}"
+                            texto_acumulado += bloque_nuevo
+                
+                if "capas_referencia" in valores:
+                    capas_visuales = valores["capas_referencia"]
+
+                yield texto_acumulado, datos_mapa_final, html_esperada, info_actual, capas_visuales
+
+    except Exception as e:
+        yield f"❌ Error: {str(e)}", None, None, None, []
+
+def interaccion_usuario(mensaje, history):
+    if not mensaje: return "", history
+    if history is None: history = []
+    history.append({"role": "user", "content": mensaje})
+    return "", history
+
+def interaccion_bot(history, state_datos, session_id):
+    if not history: yield [], None, None, None; return
+
+    try:
+        ultimo_mensaje = history[-1].get("content", "")
+    except (IndexError, AttributeError):
+        yield history, gr.update(), gr.update(), gr.update(), state_datos
+        return
+    
+    history.append({"role": "assistant", "content": ""})
     
     try:
-        # Primer intento: análisis directo de JSON
-        parsed = json.loads(message_content)
-        print("******** Salida del supervisor analizada con éxito")
-    except json.JSONDecodeError:
-        print("!!!!!! El análisis directo de JSON falló, intentando extraer JSON...")
-        print(f"Respuesta completa:\n{message_content}\n")
-        
-        # Segundo intento: buscar el JSON más cuidadosamente
-        # Buscar desde la primera { hasta la última }
-        start_idx = message_content.find('{')
-        if start_idx != -1:
-            # Contar llaves para encontrar el final del objeto JSON
-            brace_count = 0
-            end_idx = -1
-            for i in range(start_idx, len(message_content)):
-                if message_content[i] == '{':
-                    brace_count += 1
-                elif message_content[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_idx = i + 1
-                        break
+        # Recibimos html_esp en lugar de dict_esp
+        for resp_txt, datos_mapa, html_esp, info_act, capas_extra in logica_chat(ultimo_mensaje, history[:-1], session_id):
             
-            if end_idx != -1:
-                json_str = message_content[start_idx:end_idx]
-                try:
-                    parsed = json.loads(json_str)
-                    print(f"✅ JSON extraído: {parsed}")
-                except json.JSONDecodeError as e:
-                    print(f"!!!!!! JSON extraído es inválido: {e}")
-                    print(f"Texto extraído: {json_str[:200]}")
-                    parsed = {}
-            else:
-                print("!!!!!!! No se encontró JSON válido (llaves no balanceadas)")
-                parsed = {}
-        else:
-            print("!!!!!! No se encontró { en la respuesta")
-            parsed = {}
+            history[-1]["content"] = resp_txt
+            
+            update_mapa = gr.update()
+            if datos_mapa or capas_extra:
+                html_mapa = funciones.generar_mapa_resultados(datos_mapa if datos_mapa else [], 
+                    capas_extra=capas_extra)
+                update_mapa = gr.HTML(value=html_mapa)
+            
+            # Actualizamos el HTML de esperadas
+            update_esp = gr.HTML(value=html_esp, visible=True) if html_esp else gr.update()
+                        
+            yield history, update_mapa, update_esp #, update_act
+                
+    except Exception as e:
+        history[-1]["content"] = f"❌ Error: {str(e)}"
+        yield history, gr.update(), gr.update(), gr.update()
 
-    next_agent = parsed.get("next_agent", "agente_ayuda_general")
-    task = parsed.get("task", "Ayudar al usuario con su consulta")
-    justification = parsed.get("justification", "")
-
-    print(f"---DECISIÓN DEL SUPERVISOR: {next_agent}---")
-    print(f"Tarea: {task}")
-    print(f"Razón: {justification}")
-
-    # Actualizar el historial de la conversación con el intercambio actual
-    updated_conversation = conversation_history + f"\nAsistente: Enrutando a {next_agent} para: {task}"
-
-    print(f"➡️ Enrutando a: {next_agent}")
-    return {
-        "next_agent": next_agent,
-        "task": task,
-        "justification": justification,
-        "conversation_history": updated_conversation,
-        "n_iteration": n_iter
-    }
+# --- 7. GEE MAPA BASE ---
+import geemap.foliumap as geemap
+import ee
 
 
+# gee_project = os.getenv("GEE_PROJECT", "")
+# _ee_initialized = False
 
-# AGENTE Climático
-####################################3
+# def gee_inicializar():
+#     global _ee_initialized
+#     if _ee_initialized: return
+#     try:
+#         ee.Initialize(project=gee_project)
+#         _ee_initialized = True
+#     except:
+#         try:
+#             ee.Authenticate()
+#             ee.Initialize(project=gee_project)
+#             _ee_initialized = True
+#         except: pass
 
-def agente_climatico(state):
-    logger.info("************* Agente Climático")
-    logger.debug(f"Estado del Agente Climático: { {k: v for k, v in state.items() if k != 'messages'} }")
+# gee_inicializar()
+
+
+def generar_mapa_html():
+    """
+    Genera el mapa base inicial usando Folium y Esri Satellite 
+    para que sea IDÉNTICO al mapa de resultados.
+    """
+    try:
+        # 1. Crear mapa centrado en Perú (Mismo zoom y centro que funciones.py)
+        m = folium.Map(
+            location=[-12.0464, -77.0428], 
+            zoom_start=6,
+            tiles='Esri.WorldImagery' # <--- CLAVE: El mismo fondo satelital
+        )
+        
+        # 2. Agregar etiquetas (Fronteras y Nombres)
+        # Esto hace que el mapa satelital tenga nombres de ciudades encima
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri',
+            name='Etiquetas',
+            overlay=True
+        ).add_to(m)
+
+        # 3. Control de Capas
+        folium.LayerControl().add_to(m)
+
+        # 4. Retornar HTML (Sin iframes extraños, directo de Folium)
+        return m._repr_html_()
+        
+    except Exception as e:
+        return f"<div style='padding:20px; color:red;'>Error cargando mapa base: {str(e)}</div>"
+
+# --- 8. INTERFAZ GRÁFICA ---
+
+with gr.Blocks(title="Geo-Agente") as interfaz:
     
-    prompt = prompts.PROMPT_CLIMATICO.format(
-        task=state.get("task"),
-        conversation_history=state.get("conversation_history", "")
+    mensaje_inicial = [{"role": "assistant", "content": "Hola, soy tu asesor Geo-Climático. Dime ¿qué actividad estás interesado en emprender?"}]
+    
+    gr.Markdown("## 🌍 Sistema Geoespacial Inteligente")
+
+    session_id = gr.State(lambda: str(uuid.uuid4()))
+    estado_datos = gr.State([])
+    
+    with gr.Row():
+        # --- COLUMNA 1: MAPA (40%) ---
+        with gr.Column(scale=4, min_width=400):
+            gr.Markdown("### 🗺️ Visualización Geográfica")
+            mapa_view = gr.HTML(value=generar_mapa_html())
+
+        # --- COLUMNA 2: CARACTERÍSTICAS (30%) ---
+        with gr.Column(scale=3, min_width=300):
+            gr.Markdown("### 📊 Características")
+            
+            # FILA SUPERIOR: Condiciones Esperadas (HTML Tabla)
+            with gr.Group():
+                gr.Markdown("**Condiciones Esperadas (Reglas):**")
+                # CAMBIO IMPORTANTE: gr.HTML en vez de gr.JSON
+                view_esperadas = gr.HTML(label="Reglas del Cultivo")
+
+            # FILA INFERIOR: Condiciones Actuales (JSON Top 5)
+            #with gr.Group():
+                #gr.Markdown("**Condiciones Actuales (Top Resultados):**")
+                #view_actuales = gr.JSON(label="Datos Detectados", value={}, max_height=500, visible=False)
+
+        # --- COLUMNA 3: CHAT (30%) ---
+        with gr.Column(scale=3, min_width=300):
+            gr.Markdown("### 💬 Asistente IA")
+            
+            chatbot = gr.Chatbot(value=mensaje_inicial, height=550, label="Chat")
+            msg = gr.Textbox(placeholder="Escribe tu consulta...", container=False)
+            
+            with gr.Row():
+                submit_btn = gr.Button("Enviar", variant="primary")
+                clear_btn = gr.Button("Limpiar")
+
+    # --- EVENTOS ---
+    lista_outputs = [chatbot, mapa_view, view_esperadas]  # Retirado view_actuales
+
+    msg.submit(
+        interaccion_usuario, [msg, chatbot], [msg, chatbot], queue=False
+    ).then(
+        interaccion_bot, [chatbot, estado_datos, session_id], lista_outputs
     )
 
-    tools = [
-        {"type": "function", "function": {
-            "name": "temperatura_old",
-            "description": "Obtiene el clima de un rango de fechas de una región geográficoa dada.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "fechainicial": {
-                        "type": "string",
-                        "description": "Fecha de inicio del rango (formato: YYYY-MM-DD)"
-                    },
-                    "fechafinal": {
-                        "type": "string",
-                        "description": "Fecha de fin del rango (formato: YYYY-MM-DD)"
-                    },
-                    "region": {
-                        "type": "string",
-                        "description": "Región geográfica"
-                    }
-                },
-                "required": ["fechainicial", "fechafinal", "region"]
-            }
-        }},
-         {"type": "function", "function": {
-            "name": "temperatura",
-            "description": "Obtiene el clima de un rango de fechas de una región geográfica dada.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "peticion": {
-                        "type": "string",
-                        "description": "Es la petición en lenguaje natural para obtener la temperatura"
-                    },
-                },
-                "required": ["peticion"]
-            }
-        }}
-    ]
-
-
-    result = run_llm(prompt, tools, tool_functions={"temperatura_old": funciones.temperatura, "temperatura": funciones.temperatura_libre})
-    print ("Resultado de funciones.temperatura_libre:", result)
-
-        
-    # Actualizar el historial de la conversación
-    current_history = state.get("conversation_history", "")
-    updated_state = {"messages": [("assistant", result)]}
-    updated_state["conversation_history"] = current_history + f"\nAgente Climático: {result}"
-
-    logger.info("********* Agente climático completado")
-
-    return updated_state
-
-
-
-#   AGENTE DE AYUDA
-#########################################
-def nodo_agente_ayuda_general(state):
-    print("---AGENTE DE AYUDA GENERAL---")
-
-    print("✅ Agente de ayuda general completado")
-    respuesta_final = "Sin respuesta"
-    conversation_history = state.get("conversation_history", "")
-    updated_state = state.copy()
-
-
-    updated_state["conversation_history"] = conversation_history + f"\nAgente de Ayuda General: {respuesta_final}"
-
-    return updated_state
-
-
-
-#   AGENTE DE RESPUESTA FINAL
-#########################################
-
-def agente_respuesta_final(state):
-    """Generar un resumen final antes de terminar la conversación"""
-    print("---AGENTE DE RESPUESTA FINAL---")
-    logger.info("Agente de respuesta final iniciado")
-    
-    user_query = state["user_input"]
-    conversation_history = state.get("conversation_history", "")
-    
-    # Extraer la respuesta más reciente del especialista
-    recent_responses = []
-    for msg in reversed(state.get("messages", [])):
-        if hasattr(msg, 'content') and "clarification" not in msg.content.lower():
-            recent_responses.append(msg.content)
-            if len(recent_responses) >= 2:  # Obtener las últimas 2 respuestas que no sean aclaraciones
-                break
-    
-    specialist_response = recent_responses[0] if recent_responses else "No hay respuesta disponible."
-    
-    prompt = prompts.PROMPT_RESPUESTA_FINAL.format(
-
-        specialist_response=specialist_response,  
-        user_query=user_query,
+    submit_btn.click(
+        interaccion_usuario, [msg, chatbot], [msg, chatbot], queue=False
+    ).then(
+        interaccion_bot, [chatbot, estado_datos, session_id], lista_outputs
     )
     
-    print("... Generando resumen final...")
-    from langchain_core.messages import SystemMessage
-    messages = [SystemMessage(content=prompt)]
-    response = llm.invoke(messages)
-    
-    respuesta_final = response.content
-    
-    print(f"Respuesta final: {respuesta_final}")
-    
-    # Reemplazar todos los mensajes anteriores con solo la respuesta final
-    clean_messages = [("assistant", respuesta_final )]
-
-    state["respuesta_final"] = respuesta_final
-    state["end_conversation"] = True
-    state["conversation_history"] = conversation_history + f"\nAsistente: {respuesta_final}"
-    state["messages"] = clean_messages
-    
-    return state
-
-
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, List, Annotated, Dict, Any, Optional
-from langgraph.graph import add_messages
-from datetime import datetime
-
-
-class GraphState(TypedDict):
-    # Datos básicos del mensaje
-    messages: Annotated[List[Any], add_messages]
-    user_input: str
-    conversation_history: Optional[str]
-    n_iteration: Optional[int]
-
-    # Gestión del supervisor
-    next_agent: Optional[str]             
-    task: Optional[str]                   # Tarea actual determinada por el supervisor
-    justification: Optional[str]          # Razonamiento/explicación del supervisor
-    end_conversation: Optional[bool]      # Indicador para la terminación ordenada de la conversación
-    
-      
-    # Metadatos a nivel de sistema
-    timestamp: Optional[str]     # Registrar la hora del último mensaje del usuario o actualización del estado
-    respuesta_final: Optional[str]
-
-
-# Decisión de cambio de agente
-########################################
-
-def decide_next_agent(state):
-    # Manejar primero el caso de aclaración
-    if state.get("needs_clarification"):
-        return "agente_supervisor"  # Volver al supervisor para procesar la aclaración
-    
-    if state.get("end_conversation"):
-        return "end"
-    
-    next_agent = state.get("next_agent", "agente_ayuda_general")
-    
-    return next_agent
-
-
-# Actualizar el flujo de trabajo para incluir el agente de respuesta final
-#############################################################################
-
-
-workflow = StateGraph(GraphState)
-
-workflow.add_node("agente_climatico", agente_climatico)
-workflow.add_node("agente_supervisor", agente_supervisor)
-workflow.add_node("agente_ayuda_general", nodo_agente_ayuda_general)
-workflow.add_node("agente_respuesta_final", agente_respuesta_final)  # Add this
-
-workflow.set_entry_point("agente_supervisor")
-
-
-
-workflow.add_conditional_edges(
-    "agente_supervisor",
-    decide_next_agent,
-    {
-        "agente_supervisor": "agente_supervisor",
-        "agente_climatico": "agente_climatico",
-        "agente_ayuda_general": "agente_ayuda_general",
-        "end": "agente_respuesta_final"
-    }
-)
-
-# Volver al supervisor después de cada especialista
-#######################################################
-
-workflow.add_edge("agente_ayuda_general", "agente_supervisor")
-workflow.add_edge("agente_climatico", "agente_supervisor")
-workflow.add_edge("agente_respuesta_final", END)  # Respuesta Final lleva al END
-
-app = workflow.compile()
-
-
-def run_test_query(query):
-    estado_inicial = {
-
-        "messages": [],
-        "user_input": query,
-        "conversation_history": f"User: {query}", 
-        "n_iteration":0,
-        
-        "next_agent": "agente_supervisor",
-        "task": "Atender las peticiones del usuario",
-        "respuesta_final": ""
-    }
-    
-    print(f"\n{'='*50}")
-    print(f"QUERY: {query}")
-    print(f"\n{'='*50}")
-    
-    # iniciar el grafo
-    estado_final = app.invoke(estado_inicial)
-    
-    # Imprimir la respuesta
-    print("\n---RESPUESTA FINAL---")
-    respuesta_final = estado_final.get("respuesta_final", "No se generó una respuesta final.")
-    print(respuesta_final)
+    def limpiar_todo():
+        nuevo_id = str(uuid.uuid4())
+        return mensaje_inicial, generar_mapa_html(), None, nuevo_id
     
     
-    return estado_final
+    clear_btn.click(limpiar_todo, None, lista_outputs + [session_id], queue=False)
 
 
-
-# Prueba del sistema con una consulta de ejemplo
-# Pide un dato al usuario
-
-peticion = input("Ingrese la consulta de prueba para el sistema de agentes: ")
-#Ejemplo: "Dame el promedio de la temperatura de la ciudad de Canta durante el 1er semestre 2025"
-final_output =  run_test_query(peticion)
-
-
-
+if __name__ == "__main__":
+    interfaz.launch(css=".gradio-container {max_width: 98% !important}")
